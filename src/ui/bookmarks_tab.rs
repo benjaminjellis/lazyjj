@@ -14,6 +14,10 @@ use crate::{
 };
 use ansi_to_tui::IntoText;
 use anyhow::Result;
+use nucleo_matcher::{
+    Matcher, Utf32Str,
+    pattern::{AtomKind, CaseMatching, Normalization, Pattern},
+};
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers},
     prelude::*,
@@ -52,6 +56,10 @@ pub struct BookmarksTab<'a> {
     bookmarks_output: Result<Vec<BookmarkLine>, CommandError>,
     bookmarks_list_state: ListState,
     bookmarks_height: u16,
+    all_bookmarks: Vec<BookmarkLine>,
+    search: TextArea<'a>,
+    searching: bool,
+    matcher: Matcher,
 
     show_all: bool,
 
@@ -78,6 +86,38 @@ pub struct BookmarksTab<'a> {
     diff_format: DiffFormat,
 
     config: Config,
+}
+
+/// Match names (including @remote), retaining original order for equal scores.
+fn filter_bookmarks(
+    items: &[BookmarkLine],
+    query: &str,
+    matcher: &mut Matcher,
+) -> Vec<BookmarkLine> {
+    if query.trim().is_empty() {
+        return items.to_vec();
+    }
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let mut buffer = Vec::new();
+    let mut matches: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let name = match item {
+                BookmarkLine::Parsed { bookmark, .. } => bookmark.to_string(),
+                BookmarkLine::Unparsable(_) => return None,
+            };
+            pattern
+                .score(Utf32Str::new(&name, &mut buffer), matcher)
+                .map(|score| (score, item))
+        })
+        .collect();
+    matches.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    matches.into_iter().map(|(_, item)| item.clone()).collect()
 }
 
 fn get_current_bookmark_index(
@@ -141,6 +181,10 @@ impl BookmarksTab<'_> {
         let (popup_tx, popup_rx) = std::sync::mpsc::channel();
 
         Ok(Self {
+            all_bookmarks: bookmarks_output.as_ref().ok().cloned().unwrap_or_default(),
+            search: TextArea::default(),
+            searching: false,
+            matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             bookmarks_output,
             bookmark,
             bookmarks_list_state,
@@ -178,6 +222,34 @@ impl BookmarksTab<'_> {
 
     pub fn refresh_bookmarks(&mut self, commander: &mut Commander) {
         self.bookmarks_output = commander.get_bookmarks(self.show_all);
+        self.all_bookmarks = self
+            .bookmarks_output
+            .as_ref()
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        self.apply_search();
+    }
+
+    fn apply_search(&mut self) {
+        if self.bookmarks_output.is_err() {
+            self.bookmark = None;
+            return;
+        }
+        self.bookmarks_output = Ok(filter_bookmarks(
+            &self.all_bookmarks,
+            &self.search.lines().join(" "),
+            &mut self.matcher,
+        ));
+        let index = self.get_current_bookmark_index().unwrap_or(0);
+        self.bookmark = self
+            .bookmarks_output
+            .as_ref()
+            .ok()
+            .and_then(|items| items.get(index))
+            .cloned();
+        self.bookmarks_list_state
+            .select(self.get_current_bookmark_index());
     }
 
     pub fn refresh_bookmark(&mut self, commander: &mut Commander) {
@@ -319,6 +391,25 @@ impl Component for BookmarksTab<'_> {
             ])
             .split(area);
 
+        let show_search = self.searching || !self.search.lines().join(" ").is_empty();
+        let bookmark_chunks = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(if show_search { 3 } else { 0 }),
+        ])
+        .split(chunks[0]);
+        if show_search {
+            self.search.set_block(
+                Block::bordered()
+                    .title(if self.searching {
+                        " Search: Enter apply | Esc clear "
+                    } else {
+                        " Search: / edit | Esc clear "
+                    })
+                    .border_type(BorderType::Rounded),
+            );
+            f.render_widget(&self.search, bookmark_chunks[1]);
+        }
+
         // Draw bookmarks
         {
             let current_bookmark_index = self.get_current_bookmark_index();
@@ -381,7 +472,15 @@ impl Component for BookmarksTab<'_> {
             };
 
             let lines = if bookmark_lines.is_empty() {
-                vec![Line::from(" No bookmarks").fg(Color::DarkGray).italic()]
+                vec![
+                    Line::from(if show_search {
+                        " No matching bookmarks"
+                    } else {
+                        " No bookmarks"
+                    })
+                    .fg(Color::DarkGray)
+                    .italic(),
+                ]
             } else {
                 bookmark_lines
             };
@@ -389,11 +488,15 @@ impl Component for BookmarksTab<'_> {
             let bookmarks_block = Block::bordered()
                 .title(" Bookmarks ")
                 .border_type(BorderType::Rounded);
-            self.bookmarks_height = bookmarks_block.inner(chunks[0]).height;
+            self.bookmarks_height = bookmarks_block.inner(bookmark_chunks[0]).height;
             let bookmark_count = lines.len();
             let bookmarks = List::new(lines).block(bookmarks_block).scroll_padding(3);
             *self.bookmarks_list_state.selected_mut() = current_bookmark_index;
-            f.render_stateful_widget(bookmarks, chunks[0], &mut self.bookmarks_list_state);
+            f.render_stateful_widget(
+                bookmarks,
+                bookmark_chunks[0],
+                &mut self.bookmarks_list_state,
+            );
 
             // Draw scrollbar on left panel
             if bookmark_count > self.bookmarks_height.into() {
@@ -405,7 +508,7 @@ impl Component for BookmarksTab<'_> {
 
                 f.render_stateful_widget(
                     scrollbar,
-                    chunks[0].inner(Margin {
+                    bookmark_chunks[0].inner(Margin {
                         vertical: 1,
                         horizontal: 0,
                     }),
@@ -746,6 +849,39 @@ impl Component for BookmarksTab<'_> {
             return Ok(ComponentInputResult::Handled);
         }
 
+        if self.searching {
+            if let Event::Key(key) = event {
+                if key.kind == KeyEventKind::Release {
+                    return Ok(ComponentInputResult::Handled);
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        self.searching = false;
+                        return Ok(ComponentInputResult::Handled);
+                    }
+                    KeyCode::Esc => {
+                        self.searching = false;
+                        self.search = TextArea::default();
+                        self.apply_search();
+                        self.refresh_bookmark(commander);
+                        return Ok(ComponentInputResult::Handled);
+                    }
+                    KeyCode::Down | KeyCode::Up => {
+                        self.scroll_bookmarks(
+                            commander,
+                            if key.code == KeyCode::Down { 1 } else { -1 },
+                        );
+                        return Ok(ComponentInputResult::Handled);
+                    }
+                    _ => {}
+                }
+            }
+            self.search.input(event);
+            self.apply_search();
+            self.refresh_bookmark(commander);
+            return Ok(ComponentInputResult::Handled);
+        }
+
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
                 return Ok(ComponentInputResult::Handled);
@@ -757,6 +893,17 @@ impl Component for BookmarksTab<'_> {
                     self.popup.handle(&key);
                 }
 
+                return Ok(ComponentInputResult::Handled);
+            }
+
+            if key.code == KeyCode::Char('/') {
+                self.searching = true;
+                return Ok(ComponentInputResult::Handled);
+            }
+            if key.code == KeyCode::Esc && !self.search.lines().join(" ").is_empty() {
+                self.search = TextArea::default();
+                self.apply_search();
+                self.refresh_bookmark(commander);
                 return Ok(ComponentInputResult::Handled);
             }
 
@@ -787,6 +934,7 @@ impl Component for BookmarksTab<'_> {
                 KeyCode::Char('a') => {
                     self.show_all = !self.show_all;
                     self.refresh_bookmarks(commander);
+                    self.refresh_bookmark(commander);
                 }
                 KeyCode::Char('c') => {
                     let textarea = TextArea::default();
@@ -943,6 +1091,8 @@ impl Component for BookmarksTab<'_> {
                                 ("j/k".to_owned(), "scroll down/up".to_owned()),
                                 ("J/K".to_owned(), "scroll down by ½ page".to_owned()),
                                 ("a".to_owned(), "show all remotes".to_owned()),
+                                ("/".to_owned(), "fuzzy search bookmarks".to_owned()),
+                                ("Esc".to_owned(), "clear search".to_owned()),
                                 ("c".to_owned(), "create bookmark".to_owned()),
                                 ("r".to_owned(), "rename bookmark".to_owned()),
                                 ("d/f".to_owned(), "delete/forget bookmark".to_owned()),
@@ -980,5 +1130,126 @@ impl Component for BookmarksTab<'_> {
         }
 
         Ok(ComponentInputResult::Handled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commander::{bookmarks::Bookmark, tests::TestRepo};
+    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyEvent};
+
+    fn bookmark(name: &str, remote: Option<&str>) -> BookmarkLine {
+        BookmarkLine::Parsed {
+            text: name.to_owned(),
+            bookmark: Bookmark {
+                name: name.to_owned(),
+                remote: remote.map(str::to_owned),
+                present: true,
+                timestamp: 0,
+            },
+        }
+    }
+
+    fn names(items: &[BookmarkLine]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                BookmarkLine::Parsed { bookmark, .. } => bookmark.to_string(),
+                BookmarkLine::Unparsable(text) => text.clone(),
+            })
+            .collect()
+    }
+
+    fn key(tab: &mut BookmarksTab<'_>, commander: &mut Commander, code: KeyCode) {
+        assert!(matches!(
+            tab.input(
+                commander,
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+            )
+            .unwrap(),
+            ComponentInputResult::Handled
+        ));
+    }
+
+    #[test]
+    fn fuzzy_search_matches_names_and_remotes_and_ranks_results() {
+        let items = vec![
+            bookmark("fix-long-bookmark-name", Some("origin")),
+            bookmark("flbn", Some("upstream")),
+            bookmark("main", None),
+        ];
+        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        assert_eq!(
+            names(&filter_bookmarks(&items, "flbn", &mut matcher)),
+            vec!["flbn@upstream", "fix-long-bookmark-name@origin"]
+        );
+        assert_eq!(
+            names(&filter_bookmarks(&items, "flbn ori", &mut matcher)),
+            vec!["fix-long-bookmark-name@origin"]
+        );
+        assert!(filter_bookmarks(&items, "NOTFOUND", &mut matcher).is_empty());
+        assert_eq!(
+            names(&filter_bookmarks(&items, "", &mut matcher)),
+            names(&items)
+        );
+    }
+
+    #[test]
+    fn search_handles_unicode_and_smart_case() {
+        let items = vec![
+            bookmark("Feature-café", None),
+            bookmark("feature-other", None),
+        ];
+        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        assert_eq!(filter_bookmarks(&items, "feature", &mut matcher).len(), 2);
+        assert_eq!(
+            names(&filter_bookmarks(&items, "Feature", &mut matcher)),
+            vec!["Feature-café"]
+        );
+        assert_eq!(
+            names(&filter_bookmarks(&items, "café", &mut matcher)),
+            vec!["Feature-café"]
+        );
+    }
+
+    #[test]
+    fn search_input_empty_results_navigation_and_clear() -> Result<()> {
+        let mut repo = TestRepo::new()?;
+        repo.commander.create_bookmark("alpha")?;
+        repo.commander.create_bookmark("query")?;
+        let mut tab = BookmarksTab::new(&mut repo.commander)?;
+        key(&mut tab, &mut repo.commander, KeyCode::Char('/'));
+        // q is search text, not the application's quit shortcut.
+        key(&mut tab, &mut repo.commander, KeyCode::Char('q'));
+        assert_eq!(names(tab.bookmarks_output.as_ref().unwrap()), vec!["query"]);
+        key(&mut tab, &mut repo.commander, KeyCode::Char('z'));
+        assert!(tab.bookmark.is_none());
+        assert!(tab.bookmark_output.is_none());
+        key(&mut tab, &mut repo.commander, KeyCode::Down);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
+        terminal.draw(|frame| tab.draw(frame, frame.area()).unwrap())?;
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("No matching bookmarks"));
+        key(&mut tab, &mut repo.commander, KeyCode::Backspace);
+        key(&mut tab, &mut repo.commander, KeyCode::Enter);
+        assert!(!tab.searching);
+        assert_eq!(names(&[tab.bookmark.clone().unwrap()]), vec!["query"]);
+        // Refresh preserves the filter; removing the selected result clears selection.
+        tab.focus(&mut repo.commander)?;
+        assert_eq!(names(tab.bookmarks_output.as_ref().unwrap()), vec!["query"]);
+        repo.commander.delete_bookmark("query")?;
+        tab.focus(&mut repo.commander)?;
+        assert!(tab.bookmark.is_none());
+        key(&mut tab, &mut repo.commander, KeyCode::Esc);
+        assert_eq!(names(tab.bookmarks_output.as_ref().unwrap()), vec!["alpha"]);
+        assert_eq!(names(&[tab.bookmark.clone().unwrap()]), vec!["alpha"]);
+        Ok(())
     }
 }

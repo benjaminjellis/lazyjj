@@ -148,7 +148,11 @@ impl Commander {
     /// Execute a command and record to history.
     /// Environment variables can be set with set_env.
     /// They are cleared after execution.
-    fn execute_command(&self, command: &mut Command) -> Result<String, CommandError> {
+    fn execute_command(
+        &self,
+        command: &mut Command,
+        include_stderr: bool,
+    ) -> Result<String, CommandError> {
         // Set current directory to root
         command.current_dir(&self.env.root);
 
@@ -192,7 +196,14 @@ impl Commander {
             ));
         }
 
-        Ok(String::from_utf8(output.stdout)?)
+        let mut text = String::from_utf8(output.stdout)?;
+        if include_stderr {
+            if !text.is_empty() && !text.ends_with('\n') && !output.stderr.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&String::from_utf8(output.stderr)?);
+        }
+        Ok(text)
     }
 
     /// Execute a jj command with color/quiet arguments.
@@ -201,6 +212,21 @@ impl Commander {
         args: I,
         color: bool,
         quiet: bool,
+    ) -> Result<String, CommandError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.execute_jj_command_output(args, color, quiet, false)
+    }
+
+    /// Include stderr for human-facing operations; leave parsed command output unchanged.
+    pub fn execute_jj_command_output<I, S>(
+        &self,
+        args: I,
+        color: bool,
+        quiet: bool,
+        include_stderr: bool,
     ) -> Result<String, CommandError>
     where
         I: IntoIterator<Item = S>,
@@ -216,7 +242,7 @@ impl Commander {
             }
         }
 
-        self.execute_command(&mut command)
+        self.execute_command(&mut command, include_stderr)
     }
 
     /// Execute a jj command without using the output.
