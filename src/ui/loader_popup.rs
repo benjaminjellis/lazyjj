@@ -25,6 +25,7 @@ pub struct LoaderPopup {
     result_rx: Receiver<OperationResult>,
     throbber_state: ThrobberState,
     completed: bool,
+    confirm_new_bookmarks: bool,
     last_animation_update: Instant,
 }
 
@@ -46,8 +47,17 @@ impl LoaderPopup {
             result_rx: rx,
             throbber_state: ThrobberState::default(),
             completed: false,
+            confirm_new_bookmarks: false,
             last_animation_update: Instant::now(),
         }
+    }
+    pub fn push<F>(operation: F) -> Self
+    where
+        F: FnOnce() -> OperationResult + Send + 'static,
+    {
+        let mut popup = Self::new("Pushing".to_owned(), operation);
+        popup.confirm_new_bookmarks = true;
+        popup
     }
 }
 
@@ -55,6 +65,19 @@ impl Component for LoaderPopup {
     fn update(&mut self, _commander: &mut Commander) -> Result<Option<ComponentAction>> {
         if let Ok(result) = self.result_rx.try_recv() {
             self.completed = true;
+
+            if self.confirm_new_bookmarks {
+                let output = match &result {
+                    Ok(output) => output.clone(),
+                    Err(error) => error.to_string(),
+                };
+                if let Some(popup) = super::push_popup::PushPopup::from_output(output) {
+                    return Ok(Some(ComponentAction::Multiple(vec![
+                        ComponentAction::SetPopup(Some(Box::new(popup))),
+                        ComponentAction::RefreshTab(),
+                    ])));
+                }
+            }
 
             match result {
                 Ok(output) if !output.is_empty() => {

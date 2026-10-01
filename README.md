@@ -109,6 +109,9 @@ See all key mappings for the current tab with `?`.
 - Git fetch with `f` (`jj git fetch`)
   - Git fetch all remotes with `F` (`jj git fetch --all-remotes`)
 - Git push with `p` (`jj git push`)
+  - Push output and warnings are shown, including when jj exits successfully.
+  - If jj refuses a new remote bookmark, a popup offers to track and push the
+    listed bookmarks: `Create remote - y/n`. Press `y` to proceed or `n` to cancel.
   - Git push all bookmarks with `P` (`jj git push --all`)
   - Use `Ctrl+p` or `Ctrl+P` to include pushing new bookmarks (`--allow-new`)
 
@@ -119,6 +122,12 @@ See all key mappings for the current tab with `?`.
 - Toggle details panel wrapping with `W`
 
 ### Bookmarks tab
+
+- Press `/` to fuzzy-filter bookmark names and remotes as you type (smart case).
+- Use Up/Down while searching; Enter keeps the filter and restores normal actions
+  such as `t` to track and `n` to create a change. Esc clears the filter.
+- To find remote bookmarks, fetch in the Log tab, then open Bookmarks and press `a`.
+
 
 - Show bookmarks with all remotes with `a` (`jj bookmark list --all`)
 - Create a bookmark with `c` (`jj bookmark create`)

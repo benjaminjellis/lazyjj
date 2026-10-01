@@ -171,7 +171,30 @@ impl Commander {
             args.push(commit_id.as_str());
         }
 
-        self.execute_jj_command(args, true, true)
+        self.execute_jj_command_output(args, false, false, true)
+    }
+
+    /// Track only the refused bookmarks, then push them to their named remotes.
+    pub fn git_push_new_bookmarks(
+        &self,
+        bookmarks: &[(String, String)],
+    ) -> Result<String, CommandError> {
+        let mut output = String::new();
+        for (name, remote) in bookmarks {
+            output.push_str(&self.execute_jj_command_output(
+                ["bookmark", "track", name, "--remote", remote],
+                false,
+                false,
+                true,
+            )?);
+            output.push_str(&self.execute_jj_command_output(
+                ["git", "push", "--bookmark", name, "--remote", remote],
+                false,
+                false,
+                true,
+            )?);
+        }
+        Ok(output)
     }
 
     /// Git fetch. Maps to `jj git fetch`

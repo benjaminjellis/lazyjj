@@ -8,6 +8,7 @@ pub mod loader_popup;
 pub mod log_tab;
 pub mod message_popup;
 pub mod panel;
+pub mod push_popup;
 pub mod rebase_popup;
 pub mod styles;
 pub mod utils;

@@ -397,7 +397,7 @@ impl<'a> LogTab<'a> {
                 let commit_id = self.head.commit_id.clone();
                 let commander_clone = Commander::new(&commander.env);
 
-                let loader = LoaderPopup::new("Pushing".to_string(), move || {
+                let loader = LoaderPopup::push(move || {
                     commander_clone.git_push(all_bookmarks, allow_new, &commit_id)
                 });
 
